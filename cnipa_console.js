@@ -1,4 +1,4 @@
-// ===== 复制以下全部代码，粘贴到 CNIPA 官网 F12 Console 回车运行 =====
+// ===== 复制以下全部代码，粘贴到 CNIPA 官网 F12 Console 回车运行123 =====
 (function () {
     if (document.getElementById('oa-cnipa-panel')) { alert('面板已存在'); return; }
 
