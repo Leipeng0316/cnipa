@@ -475,6 +475,12 @@
 
     // ===== UI =====
     var rows=[];
+    function setProgress(text, showSpinner) {
+        var spinner = document.getElementById('oa-cnipa-spinner');
+        var textEl = document.getElementById('oa-cnipa-progress-text');
+        if (spinner) spinner.style.display = showSpinner ? 'inline-block' : 'none';
+        if (textEl) textEl.textContent = text;
+    }
     function renderStatus(){
         var el=document.getElementById('oa-cnipa-status'); if(!el) return;
         var p=[];
@@ -519,19 +525,19 @@
         if(!isAuthReady()){alert('请先在页面手动查询一个专利，等三项状态都正常');return;}
         var plan={sqxx:true,gbggxx:true,fyxx:true,zlqzyxx:true,ssxkba:true};
         rows=[]; renderPreview();
-        var progress=document.getElementById('oa-cnipa-progress'); var i=0;
+        var i=0;
         function next(){
             if(i>=ids.length){ doRetries(0); return; }
-            var no=ids[i]; progress.textContent='查询中 '+(i+1)+'/'+ids.length+'：'+no;
+            var no=ids[i]; setProgress('查询中 '+(i+1)+'/'+ids.length+'：'+no, true);
             queryOne(no,plan).then(function(results){ rows.push(buildRow(no,results)); renderPreview(); i++; setTimeout(next, 3000 + Math.random()*2000); });
         }
         // 失败重试：查完后重试失败项，再查一次失败项（共2轮）
         function doRetries(round){
             var failedRows = [];
             rows.forEach(function(r, idx){ if((r._failedKeys||[]).length) failedRows.push({row:r, no:r['专利号'], idx:idx}); });
-            if(!failedRows.length){ progress.textContent='完成，共 '+rows.length+' 条，全部成功'; return; }
-            if(round >= 2){ progress.textContent='完成，共 '+rows.length+' 条，'+failedRows.length+' 条失败（已重试2次）'; renderPreview(); return; }
-            progress.textContent='第 '+(round+1)+' 次重试失败项，共 '+failedRows.length+' 条...';
+            if(!failedRows.length){ setProgress('完成，共 '+rows.length+' 条，全部成功', false); return; }
+            if(round >= 2){ setProgress('完成，共 '+rows.length+' 条，'+failedRows.length+' 条失败（已重试2次）', false); renderPreview(); return; }
+            setProgress('第 '+(round+1)+' 次重试失败项，共 '+failedRows.length+' 条...', true);
             var j=0;
             function retryNext(){
                 if(j>=failedRows.length){ doRetries(round+1); return; }
@@ -570,7 +576,9 @@
         '#oa-cnipa-preview th,#oa-cnipa-preview td{border:1px solid #e2e8f0;padding:4px;white-space:nowrap;max-width:150px;overflow:hidden;text-overflow:ellipsis;}'+
         '#oa-cnipa-preview th{background:#f8fafc;position:sticky;top:0;}'+
         '#oa-cnipa-resize{position:absolute;right:0;bottom:0;width:16px;height:16px;cursor:nwse-resize;background:linear-gradient(135deg,transparent 50%,#999 50%);}'+
-        '#oa-cnipa-head .head-btn{cursor:pointer;padding:0 6px;font-size:16px;line-height:1;margin-left:8px;}';
+        '#oa-cnipa-head .head-btn{cursor:pointer;padding:0 6px;font-size:16px;line-height:1;margin-left:8px;}'+
+        '#oa-cnipa-spinner{display:none;width:14px;height:14px;border:2px solid #cbd5e1;border-top-color:#3664d1;border-radius:50%;animation:oa-cnipa-spin 0.7s linear infinite;vertical-align:middle;margin-right:6px;}'+
+        '@keyframes oa-cnipa-spin{to{transform:rotate(360deg);}}';
     document.documentElement.appendChild(s);
 
     var panel=document.createElement('div');
@@ -583,7 +591,7 @@
             '<div id="oa-cnipa-fields-head" style="cursor:pointer;user-select:none;font-weight:700;color:#334155;"><span id="oa-cnipa-fields-toggle">-</span> 显示字段 <span style="color:#64748b;font-weight:400;font-size:12px;">（勾选要显示的列）</span></div>'+
             '<div id="oa-cnipa-field-list" style="margin-top:6px;"></div>'+
         '</div>'+
-        '<div id="oa-cnipa-progress">等待输入</div>'+
+        '<div id="oa-cnipa-progress"><span id="oa-cnipa-spinner"></span><span id="oa-cnipa-progress-text">等待输入</span></div>'+
         '<div id="oa-cnipa-preview-wrap"><table id="oa-cnipa-preview"></table></div></div>';
     document.body.appendChild(panel);
 
