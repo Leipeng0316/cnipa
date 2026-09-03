@@ -1934,5 +1934,4 @@
         function up(){ document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); }
     })(document.getElementById('oa-cnipa-head'));
 
-    alert('面板已注入！请先手动查询一个专利，等三项状态变绿后再批量查询。');
 })();
