@@ -12,21 +12,111 @@
         tzs:    { path: '/api/view/gn/scxx/tzs',           label: '通知书信息' }
     };
     var API_KEYS = Object.keys(APIS);
-    // 查询速度调节：QUERY_CONCURRENCY=同时查询的专利数（2=默认较快；CNIPA 若频繁验证码/被拦就改回 1）；QUERY_INTERVAL_MS=每件完成后的补位间隔（越小越快）
-    var QUERY_CONCURRENCY = 2;
-    var QUERY_INTERVAL_MS = 800;
+    // 查询速度调节（按 SuperEngine 方案，2026-09-02）：QUERY_CONCURRENCY=同时查询的专利数（固定 1=全串行单飞，勿再调高，
+    // 并发≥2 即使配冷却退烧，CNIPA 400 仍占 47% 尝试、耗时钉死）；QUERY_INTERVAL_MS=每件完成后的补位间隔（SuperEngine 550ms 档）
+    // —— 查询节奏：按 SuperEngine(1).exe 的速度方案（2026-09-02 用户拍板，放弃「并发2+错峰+冷却救火」路线）——
+    //    SuperEngine 逆向规则：单件内接口「串行单飞」、接口间睡 250-350ms；件与件单飞间隔 ~550ms → 任意时刻全站在飞 ≤1，
+    //    把瞬时请求密度压到 CNIPA 反爬阈值之下长期跑不触发 400（此前并发≥2 即使加冷却退烧，400 仍占 47% 尝试、耗时不降）。
+    //    落地：① QUERY_CONCURRENCY=1（整批逐件串行，见 start/startEnhance 的 while 补位）；
+    //    ② 件内 6 接口不齐发，改 queryOne 串行链：上一接口彻底结束（含重试）后睡 250-350ms 再发下一个；
+    //    ③ 件间补位 QUERY_INTERVAL_MS(550)+rand*400（≈0.55-0.95s，对应 SuperEngine 批量单飞 550ms）；
+    //    ④ 失败接口只重查失败键、整批最多 3 轮（doRetries/enhanceRetries，round>=3 停），与 SuperEngine「失败重试3轮」同构。
+    //    冷却退居「保险」：稳态下 coolUntil=0，pacedNet/paceDelay 零额外延迟不拖节奏；
+    //    真撞 400/403/405/412/429 只停固定 COOL_BASE_MS(2s) 再继续、不升级——串行在飞=1 不会自激风暴，
+    //    升级冻结(3s×2→20s)只会让每次零星 400 白等 4-20s（实测 20件 11 次 400 白耗 40s+，2026-09-02 起改固定短停）。
+    var QUERY_CONCURRENCY = 1;
+    var QUERY_INTERVAL_MS = 550;   // 件间补位基准（SuperEngine 单飞 550ms）；paceDelay 内叠 rand*400
+    var PACE_INTRA_MIN = 250;      // 件内接口间睡眠基准，+rand*100 → 250-350ms（SuperEngine 档位）
+    var NET_MAX_ACTIVE = 3;
+    var COOL_BASE_MS = 2000;   // 固定短停：撞限流只停 2s 再继续（不再 ×2 升级——串行下不会自激，升级只会白等）
+    var COOL_MAX_MS = 2000;    // =BASE，无升级、无退烧
+    var COOL_CLEAN_ROWS = 15;
+    var coolUntil = 0;    // 短停结束时刻(ms)
+    var cleanRows = 0;    // 连续全成功件数（满 COOL_CLEAN_ROWS 提前清零短停）
+    var netActive = 0, netQueue = [];  // 在途请求信号量
+    function coolRemaining(){ return Math.max(0, coolUntil - Date.now()); }
+    function coolReset(){ coolUntil = 0; cleanRows = 0; }
+    function triggerCool(){ coolUntil = Date.now() + COOL_BASE_MS; cleanRows = 0; }
+    function noteCleanRow(){
+        // 连续全成功 COOL_CLEAN_ROWS 件：提前解除可能残留的短停（固定短停，无退烧）
+        cleanRows++;
+        if(cleanRows >= COOL_CLEAN_ROWS) coolReset();
+    }
+    function paceDelay(){
+        var rem = coolRemaining();
+        return (rem > 0 ? rem : 0) + QUERY_INTERVAL_MS + Math.random()*400;
+    }
+    function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+    // 在途信号量：串行化网络请求，超过上限就排队（fn 返回 Promise）
+    function withNetSlot(fn){
+        return new Promise(function(resolve, reject){
+            netQueue.push({fn:fn, resolve:resolve, reject:reject});
+            pumpNet();
+        });
+    }
+    function pumpNet(){
+        while(netActive < NET_MAX_ACTIVE && netQueue.length){
+            var job = netQueue.shift(); netActive++;
+            job.fn().then(function(v){ netActive--; job.resolve(v); pumpNet(); },
+                          function(e){ netActive--; job.reject(e); pumpNet(); });
+        }
+    }
+    // 带冷却门的网络请求：冷却中不发新请求，等到冷却结束再发（避免自激重试风暴）
+    function pacedNet(fn){
+        return new Promise(function(resolve, reject){
+            var rem = coolRemaining();
+            if(rem > 0){ setTimeout(function(){ withNetSlot(fn).then(resolve, reject); }, rem + 150 + Math.random()*300); }
+            else withNetSlot(fn).then(resolve, reject);
+        });
+    }
+    // —— 批次控制：总耗时（暂停/继续按钮已按用户要求删除，另加轻量运行锁防重复开批）——
+    var batchActive = false;  // true=有一批（开始查询/更新信息/失败重查）在跑；期间再点这几个按钮直接忽略，防止并发批次互相覆盖 rows
+    var batchStartTs = 0;    // 批次开始时刻(ms)，结束消息里显示总耗时
+    function fmtElapsed(){
+        if(!batchStartTs) return '';
+        var s = Math.max(0, Math.round((Date.now()-batchStartTs)/1000));
+        var h = Math.floor(s/3600), m = Math.floor(s%3600/60), sec = s%60;
+        return (h>0 ? h+':' : '') + (m<10?'0':'') + m + ':' + (sec<10?'0':'') + sec;
+    }
+    function beginBatch(){ batchActive = true; batchStartTs = Date.now(); }
+    function endBatch(){
+        batchActive = false;
+        // 批量自然结束时：进度条末尾追加错误统计 + 控制台 console.table（供「跑一波数据」看频次）
+        if (diag && diag.tries > 0) {
+            var line = diagSummaryLine();
+            setTimeout(function(){
+                var el = document.getElementById('oa-cnipa-progress-text');
+                if (el && line) el.textContent += line;
+            }, 0);
+            try { diagReport(); } catch (e) {}
+        }
+        // 方案三：批次结束仍有失败行 → 打顽固失败快照（专利号/失败接口/错误摘要）
+        try { snapshotFailures(); } catch (e) {}
+    }
     // 全部字段（顺序：申请日放在专利类型后面；含「是否保全」=通知书名称含「保全」则代表有保全信息）
     var ALL_HEADERS = ['专利号','专利名称','专利类型','申请日','案件状态','申请人','费用种类','应缴金额','截止日期','代理所','质押状态','授权公告日','法律状态','是否保全','费用状态','最近缴费人','最近缴费种类','变更费','质押信息','许可备案信息'];
-    // 默认显示字段
-    var DEFAULT_HEADERS = ['专利号','专利名称','专利类型','申请日','案件状态','是否保全','申请人','应缴金额','截止日期','代理所','质押状态'];
-    var STORAGE_KEY = 'oa_cnipa_headers';
-    var OLD_DEFAULT = ['专利号','专利名称','专利类型','申请人','案件状态','应缴金额','截止日期','代理所','质押状态'];
+    // 默认显示字段（2026-09-03 起恢复 8 个基础列，代理所默认勾选——勾上「代理所」才会让 sqxx 补代理所/确证无则落「无代理所」；
+    // 按「字段→接口依赖」裁剪接口计划：默认只跑 sqxx+fyxx 两接口/件（代理所/名称/类型/状态/申请人同源 sqxx）；
+    // 勾「质押状态/质押信息/是否保全/许可备案信息/授权公告日」对应 zlqzyxx/tzs/ssxkba/gbggxx —— 选了哪个才多跑哪个接口）
+    var DEFAULT_HEADERS = ['专利号','专利名称','专利类型','案件状态','申请人','应缴金额','截止日期','代理所'];
+    // key 带日期版：换 key 直接丢弃旧 key 里的旧默认/旧自选，保证新默认列生效
+    // （2026-09-03 起代理所回归默认勾选；仍不默认的可选列：质押状态/质押信息/是否保全/许可备案信息/授权公告日，勾了才多跑对应接口）
+    var STORAGE_KEY = 'oa_cnipa_headers_20260903';
+    // 历史上发过版的默认列（按顺序精确匹配才迁移到最新默认；用户自选过的列不动。
+    // 注：无代理所 7 列旧默认不入此表——换 key 已丢弃旧自选；若入表，用户日后手动取消勾选代理所还原成 7 列会在重载时被强行迁回 8 列）
+    var SUPERSEDED_DEFAULTS = [
+        ['专利号','专利名称','专利类型','申请人','案件状态','应缴金额','截止日期','代理所','质押状态'],
+        ['专利号','专利名称','专利类型','申请日','案件状态','是否保全','申请人','应缴金额','截止日期','代理所','质押状态'],
+        ['专利号','专利名称','专利类型','案件状态','申请人','应缴金额','截止日期','代理所']
+    ];
     function getSelectedHeaders() {
         try {
             var saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
             var f = Array.isArray(saved) ? saved.filter(function(h){ return ALL_HEADERS.indexOf(h) > -1; }) : [];
-            // 旧默认值升级到新默认（案件状态移到专利类型后 + 新增是否保全）
-            if (f.length === OLD_DEFAULT.length && OLD_DEFAULT.every(function(h,i){ return f[i]===h; })) return DEFAULT_HEADERS.slice();
+            for (var si=0; si<SUPERSEDED_DEFAULTS.length; si++) {
+                var old = SUPERSEDED_DEFAULTS[si];
+                if (f.length === old.length && old.every(function(h,i){ return f[i]===h; })) return DEFAULT_HEADERS.slice();
+            }
             if (f.length) return f;
         } catch(e) {}
         return DEFAULT_HEADERS.slice();
@@ -35,6 +125,38 @@
         try { localStorage.setItem(STORAGE_KEY, JSON.stringify(headers.filter(function(h){ return ALL_HEADERS.indexOf(h) > -1; }))); } catch(e) {}
     }
     var selectedHeaders = getSelectedHeaders();
+    // ===== 字段→接口依赖：勾了哪些列就只跑这些列需要的接口，没勾的接口不请求（SuperEngine「按可见列裁剪接口计划」同款）=====
+    // sqxx 申请信息(名称/类型/申请日/案件状态/申请人/代理所/法律状态)、fyxx 费用(应缴/截止/费用状态…)、gbggxx 公告(授权公告日)、
+    // zlqzyxx 质押(质押状态/质押信息)、tzs 通知书(是否保全)、ssxkba 许可备案(许可备案信息)
+    var HEADER_API = {
+        '专利名称':'sqxx','专利类型':'sqxx','申请日':'sqxx','案件状态':'sqxx','申请人':'sqxx','代理所':'sqxx','法律状态':'sqxx',
+        '费用种类':'fyxx','应缴金额':'fyxx','截止日期':'fyxx','费用状态':'fyxx','最近缴费人':'fyxx','最近缴费种类':'fyxx','变更费':'fyxx',
+        '授权公告日':'gbggxx',
+        '质押状态':'zlqzyxx','质押信息':'zlqzyxx',
+        '是否保全':'tzs',
+        '许可备案信息':'ssxkba'
+    };
+    function planForHeaders(headers) {
+        var plan = {}; API_KEYS.forEach(function(k){ plan[k]=false; });
+        (headers||[]).forEach(function(h){ var k = HEADER_API[h]; if(k) plan[k] = true; });
+        return plan;
+    }
+    function isBlank(v){ return v === undefined || v === null || String(v).trim() === ''; }
+    // 「缺什么补什么」：按行看，某个已勾选显示字段仍是空白 → 若它来源接口没「成功取过」就需要查该接口填上。
+    // 字段已有数据绝不重查、绝不覆盖（公司搜索出的行已带 名称/类型/状态/申请人，不勾 代理所 就不会去查 sqxx）；
+    // 只有「成功取过」才不再重查——含可选接口 404 空记录（确证无质押/许可/通知书等，字段空是最终态）；
+    // 取过但失败(ok:false)且字段仍空白 → 仍算缺，更新信息会再查（如 sqxx 404=该号无公开记录，整行空白应能重查并被报失败）。
+    function rowNeededApis(row, headers) {
+        var need = [], want = {};
+        (headers || []).forEach(function(h){
+            var k = HEADER_API[h];
+            if(!k || want[k]) return;
+            if(row._results && row._results[k] && row._results[k].ok) return;  // 该接口已成功取过 → 不再重查
+            if(!isBlank(row[h])) return;                                        // 该字段已有数据 → 不覆盖
+            want[k] = 1; need.push(k);
+        });
+        return need;
+    }
 
     // ===== 认证状态 =====
     // hhp4kgam：URL 查询参数里的 hHp4Kgam（buildApiUrl 拼到 URL）
@@ -88,6 +210,20 @@
         renderStatus();
     }
     function isAuthReady() { return !!(auth.authorization && auth.userType && auth.hhp4kgam); }
+    // 授权三要素自检（口径与 renderStatus 三盏灯一致：登录=authorization、身份=userType、环境=hhp4kgam）。
+    // 点「开始查询」/「搜索并查询」前若任一未变绿 → 提示并中止，避免白开一批全是 401/空 token。
+    function authReadyOrPrompt(action){
+        var missing = [];
+        if(!auth.authorization) missing.push('登录');
+        if(!auth.userType) missing.push('身份');
+        if(!auth.hhp4kgam) missing.push('环境');
+        if(missing.length){
+            alert(action + '未执行：授权三要素【' + missing.join('、') + '】未就绪（未变绿）。\n\n请先确认已登录 CNIPA 并刷新/正常操作一次页面（让本面板抓到授权请求头）；待下方状态 登录/身份/环境 三盏灯全绿后再点「' + action + '」。');
+            setProgress(action + '未执行：授权未就绪【' + missing.join('、') + '】未变绿，待全绿后再试', false);
+            return false;
+        }
+        return true;
+    }
 
     // ===== 工具函数 =====
     function clean(v) {
@@ -381,6 +517,68 @@
         return { status: '有保全', info: found.slice(0, 3).join('；') };
     }
 
+    // ===== 错误统计（诊断用，不影响查询逻辑）=====
+    // 每跑完一批（开始查询/更新信息/失败重查）在进度条末尾追加一行错误统计 + 控制台 console.table；
+    // 也可随时在控制台执行 window.oaCnipaErrReport() 看当前累计。
+    // 目的：用真实数据确认 400/401/404/非JSON/超时到底哪个频繁，再决定要不要改限速策略。
+    var diag = { batch: '', tries: 0, ok: 0, byKind: {}, byStatus: {}, byCode: {} };
+    function diagReset(tag){
+        diag = { batch: tag || '', tries: 0, ok: 0, byKind: {}, byStatus: {}, byCode: {} };
+    }
+    function diagTry(){ diag.tries++; }
+    function diagOk(){ diag.ok++; }
+    function diagErr(kind, status, code){
+        diag.byKind[kind] = (diag.byKind[kind] || 0) + 1;
+        if (status != null) diag.byStatus['HTTP ' + status] = (diag.byStatus['HTTP ' + status] || 0) + 1;
+        if (code != null) diag.byCode['code=' + code] = (diag.byCode['code=' + code] || 0) + 1;
+    }
+    function diagReport(){
+        var fail = 0;
+        Object.keys(diag.byKind).forEach(function(k){ fail += diag.byKind[k]; });
+        var table = [
+            { '统计': '批次', '内容': diag.batch || '—' },
+            { '统计': '接口调用尝试次数', '内容': diag.tries },
+            { '统计': '成功', '内容': diag.ok },
+            { '统计': '失败事件(含重试中的偶发)', '内容': fail }
+        ];
+        Object.keys(diag.byKind).sort().forEach(function(k){
+            table.push({ '统计': '失败·' + k, '内容': diag.byKind[k] });
+        });
+        try { console.table(table); } catch (e) { console.log(table); }
+        if (Object.keys(diag.byStatus).length) {
+            try { console.table(Object.keys(diag.byStatus).sort().map(function(k){ return { 'HTTP状态': k, '次数': diag.byStatus[k] }; })); } catch (e) {}
+        }
+        if (Object.keys(diag.byCode).length) {
+            try { console.table(Object.keys(diag.byCode).sort().map(function(k){ return { '业务code': k, '次数': diag.byCode[k] }; })); } catch (e) {}
+        }
+        return JSON.parse(JSON.stringify(diag));
+    }
+    function diagSummaryLine(){
+        var keys = Object.keys(diag.byKind);
+        if (!keys.length) return ' | 本次无错误（成功 ' + diag.ok + ' 次）';
+        return ' | 错误 ' + keys.map(function(k){ return k + '×' + diag.byKind[k]; }).sort().join(' ') + '（成功 ' + diag.ok + ' 次）';
+    }
+    // 快照「重试到底仍失败」的行：console.table 输出 专利号 + 失败接口 + 错误摘要，
+    // 用来定位 7 条顽固失败是否固定在某个接口/专利类型（是 → 之后可做接口计划裁剪）
+    function snapshotFailures(){
+        var snaps=[];
+        try {
+            if(typeof rows !== 'undefined') rows.forEach(function(r){
+                if(!r) return;
+                var keys = r._failedKeys || [];
+                if(!keys.length) return;
+                snaps.push({
+                    '专利号': r['专利号'] || '',
+                    '失败接口': keys.map(function(k){ return APIS[k] ? APIS[k].label : k; }).join('、'),
+                    '错误摘要': String(r['查询错误'] || '').slice(0, 200)
+                });
+            });
+        } catch(e){}
+        if(!snaps.length) return;
+        try { console.table(snaps); } catch(e){ console.log(snaps); }
+    }
+    window.oaCnipaErrReport = diagReport;
+
     // ===== API 调用 =====
     function buildApiUrl(apiKey, includeHhp) {
         var path = APIS[apiKey].path;
@@ -409,33 +607,67 @@
             xhr.send(JSON.stringify(payload));
         });
     }
+    function isThrottleStatus(s){ return /^(400|403|405|412|429)$/.test(String(s)); }
+    function shortBody(t){
+        var s = clean(t); if(!s) return '';
+        s = s.replace(/\s+/g,' ');
+        return s.length > 60 ? ':' + s.slice(0,60) + '…' : ':' + s;
+    }
     function callApi(apiKey, appNo) {
         var baseHeaders = {'Content-Type':'application/json;charset=utf-8','Accept':'application/json, text/plain, */*','Authorization':auth.authorization};
         if(auth.userType) baseHeaders.userType = auth.userType;
         var payload = buildApiPayload(apiKey, appNo);
-        var attempts = [ function(){ return postJsonFetch(buildApiUrl(apiKey,false), baseHeaders, payload); } ];
+        // 每个请求都过「冷却门 + 在途信号量」：冷却中不发、全站在飞≤3，把突发削平
+        var attempts = [ function(){ return pacedNet(function(){ return postJsonFetch(buildApiUrl(apiKey,false), baseHeaders, payload); }); } ];
         if(auth.hhp4kgam || auth.hhp4kgamHeader){
             var hhpHeaders = {}; Object.keys(baseHeaders).forEach(function(k){hhpHeaders[k]=baseHeaders[k];});
             hhpHeaders['Content-Type']='application/json;charset=UTF-8';
             hhpHeaders['Usertype']=auth.userType||''; hhpHeaders['Hhp4kgam']=auth.hhp4kgamHeader || auth.hhp4kgam;
-            attempts.push(function(){ return postJsonXhr(buildApiUrl(apiKey,true), hhpHeaders, payload); });
+            attempts.push(function(){ return pacedNet(function(){ return postJsonXhr(buildApiUrl(apiKey,true), hhpHeaders, payload); }); });
         }
-        var errors=[];
+        var errors=[], saw404=false;
         return new Promise(function(resolve,reject){
             function tryNext(i){
-                if(i>=attempts.length){ reject(new Error(APIS[apiKey].label+': '+errors.join('；'))); return; }
+                if(i>=attempts.length){
+                    var err = new Error(APIS[apiKey].label+': '+errors.join('；'));
+                    if(saw404) err.noRetry = true;   // 申请信息(sqxx)确认 404 = 该申请号无公开记录 → 标记不整体重试
+                    reject(err); return;
+                }
+                diagTry();
                 attempts[i]().then(function(resp){
                     var text=resp.text;
                     var done=function(t){
                         // 401 = 登录态过期：清除授权、记录错误、尝试下一个接口，不中断批量查询
-                        if(resp.status===401){ auth.authorization=''; errors.push('登录态过期'); tryNext(i+1); return; }
+                        if(resp.status===401){ auth.authorization=''; diagErr('401登录态过期', resp.status); errors.push('登录态过期'); tryNext(i+1); return; }
+                        // 404 = 该接口对这件无记录。多数为可选数据（如没有质押/许可/通知书）→ 按「空数据成功」处理，不重试；
+                        // 但 sqxx(申请信息) 404 = 该申请号在 CNIPA 无任何公开记录 → 记为失败(noRetry)，整行空白可被后续重查/报出
+                        if(resp.status===404){
+                            diagErr('接口404无记录', resp.status);
+                            if(apiKey==='sqxx'){ saw404 = true; errors.push('无申请信息记录(404)'); tryNext(i+1); return; }
+                            resolve({code:200, data:null}); return;
+                        }
+                        var throttled = isThrottleStatus(resp.status);
+                        if(throttled){ triggerCool(); diagErr('HTTP'+resp.status+'限流', resp.status); }
                         var json; try{ json=JSON.parse(t); }
-                        catch(e){ errors.push('HTTP '+resp.status+' 非JSON'); tryNext(i+1); return; }
-                        if(json.code!==200){ errors.push('code='+json.code); tryNext(i+1); return; }
+                        catch(e){
+                            if(!throttled) diagErr('HTTP'+resp.status+'非JSON', resp.status);
+                            errors.push('HTTP '+resp.status+' 非JSON' + shortBody(t));
+                            tryNext(i+1); return;
+                        }
+                        if(json.code!==200){
+                            if(!throttled) diagErr('业务code!=200', null, json.code);
+                            errors.push('code='+json.code + (json.msg ? shortBody(json.msg) : ''));
+                            tryNext(i+1); return;
+                        }
+                        diagOk();
                         resolve(json);
                     };
                     if(typeof text.then==='function') text.then(done); else done(text);
-                }).catch(function(e){ errors.push(e.message||e); tryNext(i+1); });
+                }).catch(function(e){
+                    var em = e && e.message ? e.message : String(e);
+                    diagErr(/超时|timeout/i.test(em) ? '网络超时' : '网络错误');
+                    errors.push(em); tryNext(i+1);
+                });
             }
             tryNext(0);
         });
@@ -457,7 +689,9 @@
         row['专利类型']=sq.patentType||'';
         row['案件状态']=sq.caseStatus||'';
         row['申请人']=sq.applicant||'';
-        row['代理所']=sq.agency||'';
+        // 代理所：只要 sqxx(申请信息)取到就落行——与「代理所」复选框是否勾选无关，后面勾上该列直接显示，不必重查；
+        // 确证无代理机构 → 落「无代理所」（同 质押状态=未见质押信息/是否保全=无保全 的“确证无→明示”口径），不再留空白
+        row['代理所']=sq.agency || (results.sqxx && results.sqxx.ok ? '无代理所' : '');
         row['授权公告日']=grantDate||'';
         row['法律状态']=sq.legalStatus||'';
         row['是否保全']=pres.status||'';
@@ -476,19 +710,23 @@
         row['查询错误']=errs.join('；');
         row._failedKeys = failedKeys;
         row._results = results;
+        row._checked = true;   // 「开始查询」/搜索结果默认全选，方便直接点「更新信息」；勾选框只归更新用，与专利号框无关
         return row;
     }
 
     // callApi 整轮重试：callApi 内部已试 fetch→XHR 两路，这里对偶发失败（限流/超时/非JSON）再补几轮，
-    // 缓解 CNIPA 反爬导致的「查询老是失败」；登录态过期不重试
+    // 缓解 CNIPA 反爬导致的「查询老是失败」；登录态过期不重试。400 类冷却在 callApi 撞到时已触发（停手等），
+    // 这里重试同样等冷却结束再打，不再用旧的 paceExtra「+1200/-400」。
     function callApiWithRetry(apiKey, appNo, rounds) {
         var r = rounds || 2;
         return new Promise(function(resolve, reject){
             function attempt(n){
                 callApi(apiKey, appNo).then(resolve).catch(function(e){
                     if(/登录态过期|请登录/i.test(e.message || '')){ reject(e); return; }
+                    if(e && e.noRetry){ reject(e); return; }   // 已确认无记录（申请信息404）→ 再试也 404，直接判失败
                     if(n >= r){ reject(e); return; }
-                    setTimeout(function(){ attempt(n+1); }, 900*n);
+                    var rem = coolRemaining();
+                    setTimeout(function(){ attempt(n+1); }, (rem > 0 ? rem : 0) + 900*n + Math.random()*300);
                 });
             }
             attempt(1);
@@ -496,34 +734,48 @@
     }
     function queryOne(no, plan) {
         var keys = API_KEYS.filter(function(k){ return plan[k]; });
-        // 6 个接口并发请求（之前是逐条串行：耗时=Σ各接口；并发后≈最慢那个接口）；失败接口自动重试提高成功率
-        return Promise.all(keys.map(function(k){
-            return callApiWithRetry(k, no).then(function(d){ return {key:k, ok:true, data:d}; })
-                                          .catch(function(e){ return {key:k, ok:false, error:e.message}; });
-        })).then(function(list){
-            var results={};
-            list.forEach(function(r){ results[r.key] = {ok:r.ok, data:r.data, error:r.error}; });
+        // 仿 SuperEngine：件内接口「串行单飞」——上一个请求彻底结束（含重试）后睡 250-350ms 再发下一个。
+        // 不再 Promise.all 齐发/400ms 错峰：CNIPA 限流看的是任意瞬间在飞数与请求密度，全串行把速率压到稳态档。
+        var results = {};
+        var chain = Promise.resolve();
+        keys.forEach(function(k, idx){
+            chain = chain.then(function(){
+                // 第 2 个接口起，与上一个接口间隔 PACE_INTRA_MIN + rand*100 ms（SuperEngine 250-350ms 档位）
+                if(idx > 0) return sleep(PACE_INTRA_MIN + Math.random()*100);
+            }).then(function(){
+                return callApiWithRetry(k, no).then(function(d){ results[k] = {ok:true, data:d}; })
+                                               .catch(function(e){ results[k] = {ok:false, error:e.message}; });
+            });
+        });
+        return chain.then(function(){
+            // 整件全部接口成功：计一件「干净行」，连续 COOL_CLEAN_ROWS 件彻底解除冷却保险
+            if(keys.every(function(k){ return results[k] && results[k].ok; })) noteCleanRow();
             return results;
         });
     }
 
-    // 重试单行的失败接口
+    // 增量填空：把 keys 中取到的结果并入 _results（成功才覆盖，首次失败也记录以便 _failedKeys 追踪），
+    // 再用合并结果重建「候选值」——但只把「当前仍为空白」的显示字段填进去。已有数据的字段绝不覆盖：
+    // 公司搜索出的行带预填的 名称/类型/状态/申请人，只补费用等空字段时绝不会被重建抹掉。
+    function fillRowBlanks(row, no, results, keys) {
+        var merged = row._results || {};
+        keys.forEach(function(k){
+            if(results[k] && results[k].ok) merged[k] = results[k];
+            else if(results[k] && !merged[k]) merged[k] = results[k];
+        });
+        row._results = merged;
+        var cand = buildRow(no, merged);
+        ALL_HEADERS.forEach(function(h){ if(isBlank(row[h]) && !isBlank(cand[h])) row[h] = cand[h]; });
+        row._failedKeys = API_KEYS.filter(function(k){return merged[k] && !merged[k].ok;});
+        row['查询错误'] = row._failedKeys.map(function(k){ return APIS[k].label + ':' + ((merged[k]||{}).error || '失败'); }).join('；');
+    }
+    // 重试单行的失败接口（只重查失败键，取到后只填空）
     function retryRow(row, no) {
         var failedKeys = row._failedKeys || [];
         if(!failedKeys.length) return Promise.resolve();
         var plan = {}; API_KEYS.forEach(function(k){plan[k]=false;}); failedKeys.forEach(function(k){plan[k]=true;});
         return queryOne(no, plan).then(function(results){
-            // 合并成功的结果到旧结果
-            var merged = row._results || {};
-            failedKeys.forEach(function(k){
-                if(results[k] && results[k].ok){ merged[k] = results[k]; }
-            });
-            // 用合并结果重建行
-            var newRow = buildRow(no, merged);
-            // 保留专利号等原有字段（buildRow 会重建，直接替换）
-            Object.keys(newRow).forEach(function(k){ row[k] = newRow[k]; });
-            row._results = merged;
-            row._failedKeys = API_KEYS.filter(function(k){return merged[k] && !merged[k].ok;});
+            fillRowBlanks(row, no, results, failedKeys);
             return;
         });
     }
@@ -1026,7 +1278,8 @@
             return '<tr>'+cellHtml+'</tr>';
         }).join('');
         html+='</tbody>'; t.innerHTML=html;
-        // 表头全选：勾选/取消「当前筛选结果」里的全部行；勾选状态与「查专利号框」(textarea) 联动
+        // 表头全选：勾选/取消「当前筛选结果」里的全部行（只改勾选态，供「更新信息」使用；
+        // 不再回写「查专利号框」——专利号框只归「开始查询」，两者各自独立、互不覆盖）
         var chkAll=document.getElementById('oa-cnipa-check-all');
         if(chkAll){
             var visRows = rows.filter(matchStatusFilter);
@@ -1034,17 +1287,9 @@
             chkAll.onchange=function(){
                 var checked=chkAll.checked;
                 rows.forEach(function(r){ if(matchStatusFilter(r)) r._checked=checked; });
-                syncInputFromChecked();
                 renderPreview();
             };
         }
-    }
-    // 把当前勾选的专利号回写到「查专利号框」（textarea），保证两者一致：勾选/取消即改输入框内容
-    function syncInputFromChecked(){
-        var inp=document.getElementById('oa-cnipa-input'); if(!inp) return;
-        var nos=[];
-        rows.forEach(function(r){ if(r._checked && r['专利号']) nos.push(r['专利号']); });
-        inp.value = nos.join('\n');
     }
     function renderFieldSelector(){
         var box=document.getElementById('oa-cnipa-field-list'); if(!box) return;
@@ -1069,21 +1314,17 @@
     }
     function esc(t){ return clean(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
     function start(){
-        var plan={sqxx:true,gbggxx:true,fyxx:true,zlqzyxx:true,ssxkba:true,tzs:true};
-        // 有勾选的行：在现有结果上「补全详情」——勾选行的空字段填上，其他行原样保留，不删不重建
-        var checked=[];
-        rows.forEach(function(r,idx){ if(r._checked) checked.push({row:r, idx:idx}); });
-        // 还没查过 6 个详情接口的行（如搜索直接显示的申请人结果）才需要补全
-        var todo = checked.filter(function(c){ return !c.row._results; });
-        if(todo.length){ startEnhance(todo, plan); return; }
-        if(checked.length){
-            setProgress('所选专利均已查过详情，无需重复补全（失败项请用「失败重查」）', false);
-            return;
-        }
-        // 没勾选任何行 → 从输入框粘贴的申请号新建查询（整表重建）
+        if(batchActive){ setProgress('已有批次在运行（开始查询/更新信息/失败重查），请等当前批次结束', false); return; }
+        if(!authReadyOrPrompt('开始查询')) return;   // 登录/身份/环境 三盏灯未全绿 → 提示并中止
+        coolReset();     // 新批次从快节奏开始（清掉上一批遗留的冷却状态；批次中撞 400 才重新进入冷却）
+        diagReset('查询');
+        // 开始查询 = 整表新建查询：只按专利号框里的号码查询，不理会下方勾选（增量补空白用「更新信息」按钮）
+        var plan = planForHeaders(selectedHeaders);
         var input=document.getElementById('oa-cnipa-input');
         var ids=input.value.split(/[^0-9Xx]+/).map(function(v){return v.trim().toUpperCase();}).filter(function(v){return v.length>=6;});
-        if(!ids.length){alert('请先勾选要补全的专利，或在输入框粘贴申请号/专利号新建查询');return;}
+        if(!ids.length){alert('请先在专利号框粘贴要查询的申请号/专利号；或点「搜索并查询」得到列表后，勾选行再点「更新信息」');return;}
+        diag.batch = '新建查询 ' + ids.length + '件';
+        beginBatch();          // 记录批次开始：总耗时计时
         rows=[];
         // 新查询重置专利状态筛选（回「全部」），保证查一条出现一条、条数与查询数一致，不被上次筛选残留挡掉
         resetStatusFilterUI();
@@ -1100,17 +1341,17 @@
                         renderPreview();
                         doneCnt++; active--;
                         if(active === 0 && doneCnt >= ids.length){ doRetries(0); return; }
-                        setTimeout(next, QUERY_INTERVAL_MS + Math.random()*400);
+                        setTimeout(next, paceDelay());
                     });
                 })(no);
             }
         }
-        // 失败重试：查完后重试失败项，再查一次失败项（共2轮）
+        // 失败重试：查完后只重试失败行，最多 3 轮（SuperEngine「失败重试3轮只重查失败接口」同构）
         function doRetries(round){
             var failedRows = [];
             rows.forEach(function(r, idx){ if((r._failedKeys||[]).length) failedRows.push({row:r, no:r['专利号'], idx:idx}); });
-            if(!failedRows.length){ setProgress('完成，共 '+rows.length+' 条，全部成功', false); return; }
-            if(round >= 2){ setProgress('完成，共 '+rows.length+' 条，'+failedRows.length+' 条失败（已重试2次）', false); renderPreview(); return; }
+            if(!failedRows.length){ endBatch(); setProgress('完成，共 '+rows.length+' 条，全部成功，总耗时 '+fmtElapsed(), false); return; }
+            if(round >= 3){ endBatch(); setProgress('完成，共 '+rows.length+' 条，'+failedRows.length+' 条失败（已重试3次），总耗时 '+fmtElapsed(), false); renderPreview(); return; }
             setProgress('第 '+(round+1)+' 次重试失败项，共 '+failedRows.length+' 条...', true);
             var j=0;
             function retryNext(){
@@ -1125,38 +1366,67 @@
         }
         next();
     }
-    // 「补全详情」模式：以当前结果（如搜索出的该申请人全部专利）为底表，只对勾选的行逐条补全
-    // 费用/质押/公告等空字段，其余行原样保留（解决“补一条其他几十条消失”的问题）
+    // 「更新信息」：把下方勾选的专利做空白字段增量补全——只访问「已勾选且仍空白」字段所需的接口，
+    // 已有数据的字段不重查、不覆盖；当前有专利状态筛选时保持筛选不变（不清空、不改展示范围）；不访问没必要的接口
+    function updateInfo(){
+        if(batchActive){ setProgress('已有批次在运行（开始查询/更新信息/失败重查），请等当前批次结束', false); return; }
+        coolReset();     // 新批次从快节奏开始（清掉上一批遗留的冷却状态；批次中撞 400 才重新进入冷却）
+        diagReset('更新信息');
+        if(!rows.length){ alert('当前没有结果。请先点「开始查询」，或用上方条件「搜索并查询」后勾选要更新的行'); return; }
+        var plan = planForHeaders(selectedHeaders);
+        var checked=[];
+        rows.forEach(function(r,idx){ if(r._checked) checked.push({row:r, idx:idx}); });
+        if(!checked.length){ alert('请先在下方面板勾选要更新的专利（可全选）'); return; }
+        var todo=[];
+        checked.forEach(function(c){
+            var needed = rowNeededApis(c.row, selectedHeaders);
+            if(!needed.length) return;
+            todo.push({row:c.row, idx:c.idx, needed:needed});
+        });
+        if(!todo.length){ setProgress('所选专利所需字段均已齐全，无需重复补查', false); return; }
+        startEnhance(todo, plan);
+    }
+    // 「更新信息」执行体：以当前结果（搜索/查询出的）为底表，只对勾选的行逐条补「空白字段」，其余行原样保留；
+    // 与「开始查询」不同：本路径不清空专利状态筛选、不整表重建
     function startEnhance(todo, plan){
-        resetStatusFilterUI();      // 回到全部结果视图，让未勾选的行也保持可见
         var total=todo.length;
+        if(!total){ return; }
+        diag.batch = '更新信息 ' + total + '件';
+        beginBatch();
         renderPreview();
-        setProgress('补全详情 0/'+total+'（其余 '+rows.length+' 条保持不变）', true);
+        setProgress('更新信息 0/'+total+'（其余 '+rows.length+' 条保持不变，状态筛选不变）', true);
         var i=0, doneCnt=0, active=0;
         function next(){
             while(i < todo.length && active < QUERY_CONCURRENCY){
                 var it = todo[i++]; active++;
-                (function(idx, no){
-                    queryOne(no, plan).then(function(results){
-                        var nr = buildRow(no, results);
-                        nr._checked = true;          // 补全后仍保持勾选，方便再选其他行继续补
-                        rows[idx] = nr;              // 原地替换，不删其他行
+                (function(idx, row, needed){
+                    var no = row['专利号'];
+                    // 只查这行「空白字段需要」的接口：缺什么才访问什么；取到后仅填空，已有数据绝不覆盖
+                    var itemPlan = {}; API_KEYS.forEach(function(k){ itemPlan[k]=false; });
+                    needed.forEach(function(k){ itemPlan[k]=true; });
+                    queryOne(no, itemPlan).then(function(results){
+                        fillRowBlanks(row, no, results, needed);  // 仅填空：搜索行预填值/已有数据原样保留
+                        row._checked = true;                      // 更新后仍保持勾选，方便再选其他行继续更新
+                        rows[idx] = row;                          // 原地替换，不删其他行
                         doneCnt++; active--;
                         renderPreview();
-                        setProgress('补全详情 '+doneCnt+'/'+total+'（其余 '+rows.length+' 条保持不变）', doneCnt < total);
+                        setProgress('更新信息 '+doneCnt+'/'+total+'（其余 '+rows.length+' 条保持不变，状态筛选不变）', doneCnt < total);
                         if(active === 0 && doneCnt >= total){ enhanceRetries(0, total); return; }
-                        setTimeout(next, QUERY_INTERVAL_MS + Math.random()*400);
+                        setTimeout(next, paceDelay());
                     });
-                })(it.idx, it.row['专利号']);
+                })(it.idx, it.row, it.needed);
             }
         }
-        // 失败重试：只重试本次补全出来的失败行（共2轮），其余行不受影响
+        // 失败重试：只重试「本次更新批次内」失败的勾选行，最多 3 轮（SuperEngine「失败重试3轮」同构）；
+        // 表中其他行（含历史失败、本次未勾选）一律不动，不访问没必要接口
         function enhanceRetries(round, total){
             var failedRows = [];
-            rows.forEach(function(r, idx){ if((r._failedKeys||[]).length) failedRows.push({row:r, no:r['专利号'], idx:idx}); });
-            if(!failedRows.length){ setProgress('补全完成：'+total+' 条全部成功，其余 '+rows.length+' 条保持不变', false); renderPreview(); return; }
-            if(round >= 2){ setProgress('补全完成：'+total+' 条，'+failedRows.length+' 条失败（已重试2次），其余 '+rows.length+' 条保持不变', false); renderPreview(); return; }
-            setProgress('补全第 '+(round+1)+' 轮重试失败项，共 '+failedRows.length+' 条...', true);
+            todo.forEach(function(t){
+                if((t.row._failedKeys||[]).length) failedRows.push({row:t.row, no:t.row['专利号'], idx:t.idx});
+            });
+            if(!failedRows.length){ endBatch(); setProgress('更新完成：'+total+' 条全部成功，其余 '+rows.length+' 条保持不变，总耗时 '+fmtElapsed(), false); renderPreview(); return; }
+            if(round >= 3){ endBatch(); setProgress('更新完成：'+total+' 条，'+failedRows.length+' 条失败（已重试3次），其余 '+rows.length+' 条保持不变，总耗时 '+fmtElapsed(), false); renderPreview(); return; }
+            setProgress('更新第 '+(round+1)+' 轮重试失败项，共 '+failedRows.length+' 条...', true);
             var j=0;
             function retryNext(){
                 if(j>=failedRows.length){ enhanceRetries(round+1, total); return; }
@@ -1173,7 +1443,8 @@
     function exportXlsx(){
         var dispRows=visibleRows();
         if(!dispRows.length){alert('没有数据');return;}
-        var headers=ALL_HEADERS;
+        // 只导出勾选的字段列（与「显示字段」一致；没勾的可选接口根本没查，导不出内容）
+        var headers=selectedHeaders;
         var aoa=[headers].concat(dispRows.map(function(r){return headers.map(function(h){return r[h]||'';});}));
         var csv='﻿'+aoa.map(function(c){return c.map(function(x){return '"'+String(x).replace(/"/g,'""')+'"';}).join(',');}).join('\r\n');
         var blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
@@ -1220,8 +1491,7 @@
             if(cb && cb.classList && cb.classList.contains('oa-cnipa-chk')){
                 var idx=Number(cb.getAttribute('data-idx'));
                 if(idx>=0 && idx<rows.length) rows[idx]._checked=!!cb.checked;
-                // 勾选/取消勾选同步更新「查专利号框」内容，并实时刷新表头全选勾选态，保证三者一致
-                syncInputFromChecked();
+                // 只改勾选态（供「更新信息」用）；不回写「查专利号框」。实时刷新表头全选勾选态
                 var allEl=document.getElementById('oa-cnipa-check-all');
                 if(allEl){
                     var vis=rows.filter(matchStatusFilter);
@@ -1261,16 +1531,20 @@
 
     // ===== 失败重查：将查询失败的按顺序重新查 3 遍 =====
     function manualRetry(){
+        if(batchActive){ setProgress('已有批次在运行（开始查询/更新信息/失败重查），请等当前批次结束', false); return; }
+        diagReset('失败重查');
         var failedRows=[];
         rows.forEach(function(r,idx){ if((r._failedKeys||[]).length) failedRows.push({row:r,no:r['专利号'],idx:idx}); });
         if(!failedRows.length){ alert('没有失败项'); setProgress('没有失败项，无需重查', false); return; }
+        diag.batch = '失败重查 ' + failedRows.length + '条';
+        beginBatch();
         setProgress('失败重查：共 '+failedRows.length+' 条，按顺序查3遍...', true);
         var round=0;
         function roundNext(){
             var still=[];
             rows.forEach(function(r,idx){ if((r._failedKeys||[]).length) still.push({row:r,no:r['专利号'],idx:idx}); });
-            if(!still.length){ setProgress('失败重查完成：全部成功（共 '+rows.length+' 条）', false); renderPreview(); return; }
-            if(round>=3){ setProgress('失败重查完成：共 '+rows.length+' 条，仍有 '+still.length+' 条失败（已查3遍）', false); renderPreview(); return; }
+            if(!still.length){ endBatch(); setProgress('失败重查完成：全部成功（共 '+rows.length+' 条），总耗时 '+fmtElapsed(), false); renderPreview(); return; }
+            if(round>=3){ endBatch(); setProgress('失败重查完成：共 '+rows.length+' 条，仍有 '+still.length+' 条失败（已查3遍），总耗时 '+fmtElapsed(), false); renderPreview(); return; }
             round++;
             setProgress('失败重查 第'+round+'/3 遍：剩余 '+still.length+' 条...', true);
             var k=0;
@@ -1327,12 +1601,19 @@
         var headers = {'Content-Type':'application/json;charset=UTF-8','Accept':'application/json, text/plain, */*','Authorization':auth.authorization};
         if (auth.userType) headers.userType = auth.userType;
         var url = '/api/search/undomestic/publicSearch';
-        return postJsonFetch(url, headers, payload).then(function(resp){
-            if (resp.status === 401) { auth.authorization=''; throw new Error('登录态过期'); }
+        diagTry();
+        return pacedNet(function(){ return postJsonFetch(url, headers, payload); }).catch(function(e){
+            var em = e && e.message ? e.message : String(e);
+            diagErr(/超时|timeout/i.test(em) ? '搜索:网络超时' : '搜索:网络错误');
+            throw e;
+        }).then(function(resp){
+            if (resp.status === 401) { auth.authorization=''; diagErr('搜索:401登录态过期', resp.status); throw new Error('登录态过期'); }
+            if (isThrottleStatus(resp.status)) { triggerCool(); diagErr('搜索:HTTP'+resp.status+'限流', resp.status); }
             return resp.text.then(function(t){
                 var json; try { json = JSON.parse(t); }
-                catch (e) { if (/<html|<body|用户名|密码|请登录/i.test(t)) { throw new Error('登录态过期，被重定向到登录页'); } throw new Error('搜索响应非JSON（HTTP ' + resp.status + '）：' + String(t||'').slice(0,200)); }
-                if (json.code !== 200) throw new Error('搜索失败 code=' + json.code + (json.msg ? '（' + json.msg + '）' : ''));
+                catch (e) { diagErr('搜索:HTTP'+resp.status+'非JSON', resp.status); if (/<html|<body|用户名|密码|请登录/i.test(t)) { throw new Error('登录态过期，被重定向到登录页'); } throw new Error('搜索响应非JSON（HTTP ' + resp.status + '）：' + String(t||'').slice(0,200)); }
+                if (json.code !== 200) { diagErr('搜索:业务code!=200', null, json.code); throw new Error('搜索失败 code=' + json.code + (json.msg ? '（' + json.msg + '）' : '')); }
+                diagOk();
                 return json;
             });
         });
@@ -1381,7 +1662,7 @@
         else n = parseInt((data.data && data.data.total) || data.total || '', 10);
         return isNaN(n) ? 0 : n;
     }
-    // 搜索响应本身已含这些字段，无需逐个调详情接口；费用/质押等富字段留空，可点「开始查询」补全
+    // 搜索响应本身已含这些字段，无需逐个调详情接口；费用/质押等富字段留空，勾选行后点「更新信息」只补空白字段
     function parseSearchRows(json) {
         var out = [];
         // 兼容两种响应嵌套：data.records（部分接口）与 data.data.records（publicSearch 真实结构，已从 chunk 7 实证）
@@ -1405,13 +1686,14 @@
             row['申请人'] = clean(rec.shenqingrxm || rec.shenqingren || rec.sqrmc || '');
             row._failedKeys = [];
             row._fromSearch = true;
-            // 搜索出来的专利默认全选：点「开始查询」直接补全部详情，可先勾掉不需要的再查
+            // 搜索出来的专利默认全选：勾选行后点「更新信息」只补空白字段（不重查已有数据），可先勾掉不需要的再点
             row._checked = true;
             out.push(row);
         });
         return out;
     }
     function searchPatents() {
+        if(batchActive){ setProgress('已有批次在运行（开始查询/更新信息/失败重查），请等当前批次结束', false); return; }
         var applicant = clean(document.getElementById('oa-cnipa-applicant').value);
         var type = document.getElementById('oa-cnipa-type').value;
         var dateFrom = document.getElementById('oa-cnipa-appdate-from').value;
@@ -1419,6 +1701,7 @@
         var hint = document.getElementById('oa-cnipa-search-hint');
         if (!applicant && !type && !dateFrom && !dateTo) { if (hint) hint.style.display = ''; return; }
         if (hint) hint.style.display = 'none';
+        if(!authReadyOrPrompt('搜索并查询')) return;   // 登录/身份/环境 三盏灯未全绿 → 提示并中止
         var payload = buildSearchPayload(applicant, type, dateFrom, dateTo);
         setProgress('搜索中...', true);
         searchApi(payload).then(function (json) {
@@ -1426,13 +1709,12 @@
             var newRows = parseSearchRows(json);
             var total = extractSearchTotal(json);
             if (!newRows.length) { setProgress('搜索完成：该公司共 ' + (total || '?') + ' 件专利，本页未匹配到数据', false); return; }
-            // 输入框填入这批申请号（方便复制或点「开始查询」补全详情），且搜索出来的专利默认全选；可勾掉不需要的再点「开始查询」
+            // 输入框填入这批申请号（点「开始查询」即整批重查这批号）；搜索出的行默认全选，点「更新信息」只补空白字段
             document.getElementById('oa-cnipa-input').value = newRows.map(function (r) { return r['专利号']; }).join('\n');
             rows = newRows;
             resetStatusFilterUI();
             renderPreview();
-            syncInputFromChecked();
-            setProgress('搜索完成：该公司共 ' + (total || '?') + ' 件专利，已加载并默认全选 ' + newRows.length + ' 条（如需费用/质押/公告等详情，点「开始查询」补全）', false);
+            setProgress('搜索完成：该公司共 ' + (total || '?') + ' 件专利，已加载并默认全选 ' + newRows.length + ' 条（点「更新信息」补费用/质押等空白字段，已有数据不重查）', false);
         }).catch(function (e) { setProgress('搜索失败：' + (e.message || e), false); });
     }
 
@@ -1474,28 +1756,28 @@
     panel.innerHTML='<div id="oa-cnipa-head"><b>CNIPA 批量查询</b><span><span id="oa-cnipa-max" class="head-btn" title="最大化/还原">□</span><span id="oa-cnipa-close" class="head-btn" title="关闭">×</span></span></div>'+
         '<div id="oa-cnipa-body"><div id="oa-cnipa-status"></div>'+
         '<div id="oa-cnipa-search"><div style="font-weight:700;color:#334155;margin-bottom:6px;">按条件查询</div>'+
-            '<div style="display:flex;flex-wrap:wrap;align-items:center;">'+
-                '<span class="lbl">申请人 <input type="text" id="oa-cnipa-applicant" placeholder="企业/个人名称"></span>'+
-                '<span class="lbl">专利类型 <select id="oa-cnipa-type"><option value="">全部</option><option value="1">发明</option><option value="2">实用新型</option><option value="3">外观设计</option></select></span>'+
-                '<span class="lbl">申请日 <input type="date" id="oa-cnipa-appdate-from"> ~ <input type="date" id="oa-cnipa-appdate-to"></span>'+
-                '<span class="lbl">每页 <select id="oa-cnipa-size"><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option><option value="500">500</option></select> 条</span>'+
-                '<button id="oa-cnipa-search" class="primary">搜索并查询</button>'+
-            '</div>'+
-            '<div id="oa-cnipa-search-hint" style="display:none;color:#b91c1c;font-size:12px;margin-top:4px;">请至少填一个查询条件（申请人/专利类型/申请日）</div>'+
+        '<div style="display:flex;flex-wrap:wrap;align-items:center;">'+
+        '<span class="lbl">申请人 <input type="text" id="oa-cnipa-applicant" placeholder="企业/个人名称"></span>'+
+        '<span class="lbl">专利类型 <select id="oa-cnipa-type"><option value="">全部</option><option value="1">发明</option><option value="2">实用新型</option><option value="3">外观设计</option></select></span>'+
+        '<span class="lbl">申请日 <input type="date" id="oa-cnipa-appdate-from"> ~ <input type="date" id="oa-cnipa-appdate-to"></span>'+
+        '<span class="lbl">每页 <select id="oa-cnipa-size"><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option><option value="500">500</option></select> 条</span>'+
+        '<button id="oa-cnipa-search" class="primary">搜索并查询</button>'+
+        '</div>'+
+        '<div id="oa-cnipa-search-hint" style="display:none;color:#b91c1c;font-size:12px;margin-top:4px;">请至少填一个查询条件（申请人/专利类型/申请日）</div>'+
         '</div>'+
         '<textarea id="oa-cnipa-input" placeholder="每行一个申请号/专利号；或用上方条件搜索"></textarea>'+
-        '<div><button id="oa-cnipa-start" class="primary">开始查询</button><button id="oa-cnipa-export">导出CSV</button><button id="oa-cnipa-fail-retry">失败重查</button><button id="oa-cnipa-clear">清空</button></div>'+
+        '<div><button id="oa-cnipa-start" class="primary">开始查询</button><button id="oa-cnipa-update">更新信息</button><button id="oa-cnipa-export">导出CSV</button><button id="oa-cnipa-fail-retry">失败重查</button><button id="oa-cnipa-clear">清空</button></div>'+
         '<div id="oa-cnipa-fields" style="margin:8px 0;padding:8px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">'+
-            '<div id="oa-cnipa-fields-head" style="cursor:pointer;user-select:none;font-weight:700;color:#334155;"><span id="oa-cnipa-fields-toggle">-</span> 显示字段 <span style="color:#64748b;font-weight:400;font-size:12px;">（勾选要显示的列）</span></div>'+
-            '<div id="oa-cnipa-field-list" style="margin-top:6px;"></div>'+
+        '<div id="oa-cnipa-fields-head" style="cursor:pointer;user-select:none;font-weight:700;color:#334155;"><span id="oa-cnipa-fields-toggle">-</span> 显示字段 <span style="color:#64748b;font-weight:400;font-size:12px;">（勾选要显示的列）</span></div>'+
+        '<div id="oa-cnipa-field-list" style="margin-top:6px;"></div>'+
         '</div>'+
         '<div id="oa-cnipa-progress"><span id="oa-cnipa-spinner"></span><span id="oa-cnipa-progress-text">等待输入</span></div>'+
         '<div style="display:flex;align-items:center;gap:8px;margin:8px 0 4px;font-size:13px;color:#334155;">'+
-            '<span style="position:relative;display:inline-block;">'+
-                '<button id="oa-cnipa-status-btn" type="button">专利状态筛选：全部</button>'+
-                '<div id="oa-cnipa-status-pop" style="display:none;position:absolute;top:calc(100% + 3px);left:0;background:#fff;border:1px solid #cbd5e1;border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,.16);padding:6px;z-index:30;max-height:260px;overflow:auto;min-width:210px;"></div>'+
-            '</span>'+
-            '<span style="color:#94a3b8;font-size:11px;">仅影响当前结果展示与导出（可多选）</span>'+
+        '<span style="position:relative;display:inline-block;">'+
+        '<button id="oa-cnipa-status-btn" type="button">专利状态筛选：全部</button>'+
+        '<div id="oa-cnipa-status-pop" style="display:none;position:absolute;top:calc(100% + 3px);left:0;background:#fff;border:1px solid #cbd5e1;border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,.16);padding:6px;z-index:30;max-height:260px;overflow:auto;min-width:210px;"></div>'+
+        '</span>'+
+        '<span style="color:#94a3b8;font-size:11px;">仅影响当前结果展示与导出（可多选）</span>'+
         '</div>'+
         '<div id="oa-cnipa-preview-wrap"><table id="oa-cnipa-preview"></table></div>'+
         '<div style="font-size:11px;color:#94a3b8;margin-top:2px;">💡 点击/拖拽选中单元格（Shift+点击可扩展），Ctrl+C 按表格格式复制（多行多列）；操作列的「详情」不参与复制</div>'+
@@ -1559,6 +1841,7 @@
     };
     document.getElementById('oa-cnipa-close').onclick=function(){panel.style.display='none';};
     document.getElementById('oa-cnipa-start').onclick=start;
+    document.getElementById('oa-cnipa-update').onclick=updateInfo;
     document.getElementById('oa-cnipa-export').onclick=exportXlsx;
     document.getElementById('oa-cnipa-fail-retry').onclick=manualRetry;
     document.getElementById('oa-cnipa-clear').onclick=function(){
@@ -1588,11 +1871,10 @@
         });
         return html;
     }
-    // 状态筛选变化后的统一收口：被筛掉的行移出勾选集（杜绝「隐藏但勾选」的幽灵选中），
-    // 并同步输入框内容 + 按钮文案 + 表格，保证 表格勾选 / 输入框 / 开始查询 三者口径一致
+    // 状态筛选变化后的统一收口：被筛掉的行移出勾选集（杜绝「隐藏但勾选」的幽灵选中，
+    // 免得「更新信息」误更新筛选外看不到的行）；「查专利号框」不受影响，只归「开始查询」
     function applyStatusFilterChange(){
         rows.forEach(function(r){ if(!matchStatusFilter(r)) r._checked=false; });
-        syncInputFromChecked();
         updateStatusBtn();
         renderPreview();
     }
