@@ -822,13 +822,14 @@
     }
 
     // ===== 推送入库（国知局数据 cnipa_data） =====
-    // CNIPA 网页(https)跨域把当前表内专利字段推到 OA 的 /open/patent_analysis/api/cnipa-data/save。
+    // CNIPA 网页跨域把当前表内专利字段推到 OA 的 /open/patent_analysis/api/cnipa-data/save。
     // 跨域策略：后端按 text/plain 原始 body 解析（不发 application/json，避免 CORS 预检）。
-    // 生产默认：OA https 入口 xzcloud.cloud（Caddy 反代 43.143.107.131:7071，2026-09-06 上线）。
+    // 生产默认（2026-09-09 用户定）：端口接收 = 直连 OA 服务器 Tomcat 7071 端口：
+    //   http://43.143.107.131:7071/open/patent_analysis/api/cnipa-data/save
+    // 注意：CNIPA 官网是 https 页面时，浏览器会把对 http:// 目标的 fetch 当混合内容拦掉（报 Failed to fetch）。
+    //   若被拦：把下面地址临时改回 https://xzcloud.cloud/open/patent_analysis/api/cnipa-data/save（服务器 https 反代）。
     // 本机调试（OA 跑在 localhost:8080）时把下面地址临时改回 http://localhost:8080/open/patent_analysis/api/cnipa-data/save。
-    // 此前 CNIPA 页面是 https、推送目标是 http://公网IP 会被浏览器以混合内容拦截；
-    // 现生产走 https://xzcloud.cloud，同源 https 推送不再被拦。
-    var OA_PUSH_URL = 'https://xzcloud.cloud/open/patent_analysis/api/cnipa-data/save';
+    var OA_PUSH_URL = 'http://43.143.107.131:7071/open/patent_analysis/api/cnipa-data/save';
     var OA_PUSH_AUTO_KEY = 'oa_cnipa_push_auto_20260903';
     // 行内中文表头 → 后端 cnipa_data 字段（后端兼容中文 key，这里直接转驼峰）
     var CNIPA_TO_DB = {
@@ -906,7 +907,7 @@
         pushRowsToDb(list).then(function(res){
             setProgress(baseMsg + ' ✅ 已推送国知局数据 ' + res.total + ' 条（新增 ' + res.inserted + '，更新 ' + res.updated + '）', false);
         }).catch(function(e){
-            setProgress(baseMsg + ' ⚠️ 推送入库失败：' + (e && e.message ? e.message : e) + '（请确认 OA_PUSH_URL 可访问，OA 服务需在运行）', false);
+            pushFailed(baseMsg, e, manualPushRows);
         });
     }
     // 手动「推送入库」按钮
@@ -920,13 +921,77 @@
         pushRowsToDb(list).then(function(res){
             setProgress(baseMsg + ' ✅ 已推送国知局数据 ' + res.total + ' 条（新增 ' + res.inserted + '，更新 ' + res.updated + '）', false);
         }).catch(function(e){
-            setProgress(baseMsg + ' ⚠️ 推送入库失败：' + (e && e.message ? e.message : e), false);
+            pushFailed(baseMsg, e, manualPushRows);
         });
     }
     // 在进度条后面追加一小段（不覆盖主文案）
     function noteProgress(msg){
         var el = document.getElementById('oa-cnipa-progress-text');
         if(el) el.textContent += ' ' + msg;
+    }
+    // 推送失败统一收口：进度条保留红字 + 弹窗说明「该如何操作」（可重试）
+    function pushFailed(baseMsg, e, retryFn){
+        var errText = (e && e.message) ? String(e.message) : String(e);
+        setProgress(baseMsg + ' ⚠️ 推送入库失败：' + errText, false);
+        openPushErrorModal(errText, retryFn);
+    }
+    // save 出错弹窗：给出排查步骤 + 错误上下文 + 复制/重试
+    function openPushErrorModal(errText, retryFn){
+        var oldEl = document.getElementById('oa-cnipa-err-mask');
+        if(oldEl && oldEl.parentNode) oldEl.parentNode.removeChild(oldEl);
+        var host = OA_PUSH_URL.replace(/^https?:\/\//, '').split('/')[0];
+        var pageHttps = (location && location.protocol === 'https:');
+        var targetHttp = /^http:\/\//i.test(OA_PUSH_URL);
+        var mask = document.createElement('div');
+        mask.id = 'oa-cnipa-err-mask';
+        mask.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:2147483646;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;';
+        var box = document.createElement('div');
+        box.style.cssText = 'background:#fff;border-radius:10px;box-shadow:0 20px 50px rgba(0,0,0,.3);width:640px;max-width:94vw;max-height:84vh;overflow:auto;font:14px/1.6 Arial,"Microsoft YaHei",sans-serif;padding:18px 22px;box-sizing:border-box;';
+        var h = '';
+        h += '<div style="font-size:16px;font-weight:700;color:#b91c1c;margin-bottom:10px;">⚠️ 推送入库失败（save 出错）</div>';
+        h += '<div style="margin-bottom:10px;color:#475569;">推送地址：<span style="font-family:Consolas,monospace;background:#f1f5f9;padding:1px 6px;border-radius:4px;word-break:break-all;">' + esc(OA_PUSH_URL) + '</span></div>';
+        h += '<div style="font-family:Consolas,monospace;font-size:12px;background:#fef2f2;border:1px solid #fecaca;color:#7f1d1d;border-radius:6px;padding:8px 10px;margin-bottom:12px;white-space:pre-wrap;word-break:break-all;">' + esc(errText || '未知错误') + '</div>';
+        if (targetHttp && pageHttps) {
+            h += '<div style="background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:6px;padding:8px 12px;margin-bottom:10px;">' +
+                 '<b>疑似被浏览器拦截（混合内容）：</b>当前页面是 <b>https</b>，推送目标是 <b>http://' + esc(host) + '</b>。' +
+                 'CNIPA 官网 https 页面会拦掉这类 http 请求，报错常为 <code>Failed to fetch</code>。<br>处理：把脚本里 <span style="font-family:Consolas,monospace;">OA_PUSH_URL</span> 临时改回 ' +
+                 '<span style="font-family:Consolas,monospace;">https://xzcloud.cloud/open/patent_analysis/api/cnipa-data/save</span>（服务器需有 https 反代）再推送。</div>';
+        }
+        h += '<div style="font-weight:700;color:#334155;margin:6px 0 4px;">请按下面顺序排查：</div>';
+        h += '<ol style="margin:4px 0 8px 20px;padding:0;color:#475569;">';
+        h += '<li>确认 OA 服务在运行、网络可达 <b>' + esc(host) + '</b>：新标签页直接打开 <span style="font-family:Consolas,monospace;font-size:12px;word-break:break-all;">' + esc(OA_PUSH_URL) + '</span>，能返回任何响应（如 405/JSON）说明服务通；打不开就是服务没起/端口不通/网络被拦。</li>';
+        h += '<li>若错误是「OA 返回错误：…」或 HTTP 状态码：按返回信息处理；后端按专利号 upsert，重复推送不会造成重复数据，可直接重试。</li>';
+        h += '<li>本面板表格数据没丢：点下方<b>重试推送</b>，或稍后手动再点一次「推送入库」即可。</li>';
+        h += '<li>仍不行：把上方红框错误信息复制给开发（附推送地址）。</li>';
+        h += '</ol>';
+        h += '<div style="text-align:right;margin-top:12px;">';
+        h += '<button type="button" id="oa-cnipa-err-copy" style="border:1px solid #cbd5e1;background:#fff;color:#475569;border-radius:5px;padding:7px 14px;margin-right:8px;cursor:pointer;">复制错误</button>';
+        if (retryFn) h += '<button type="button" id="oa-cnipa-err-retry" style="border:1px solid #3664d1;background:#3664d1;color:#fff;border-radius:5px;padding:7px 16px;margin-right:8px;cursor:pointer;font-weight:700;">重试推送</button>';
+        h += '<button type="button" id="oa-cnipa-err-close" style="border:1px solid #cbd5e1;background:#fff;color:#475569;border-radius:5px;padding:7px 14px;cursor:pointer;">关闭</button>';
+        h += '</div>';
+        box.innerHTML = h;
+        mask.appendChild(box);
+        function closeModal(){ if(mask.parentNode) mask.parentNode.removeChild(mask); }
+        mask.addEventListener('mousedown', function(e){ if(e.target === mask) closeModal(); });
+        box.querySelector('#oa-cnipa-err-close').onclick = closeModal;
+        var copyBtn = box.querySelector('#oa-cnipa-err-copy');
+        copyBtn.onclick = function(){
+            var ta = document.createElement('textarea');
+            ta.value = errText + '\nOA_PUSH_URL=' + OA_PUSH_URL;
+            ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
+            document.body.appendChild(ta); ta.select();
+            var ok = false;
+            try { ok = document.execCommand('copy'); } catch (e) {}
+            document.body.removeChild(ta);
+            copyBtn.textContent = ok ? '已复制 ✓' : '复制失败';
+            setTimeout(function(){ copyBtn.textContent = '复制错误'; }, 1500);
+        };
+        var retryBtn = box.querySelector('#oa-cnipa-err-retry');
+        if (retryBtn) retryBtn.onclick = function(){
+            closeModal();
+            try { retryFn(); } catch (e2) { pushFailed('', e2, null); }
+        };
+        document.body.appendChild(mask);
     }
 
     // ===== UI =====
