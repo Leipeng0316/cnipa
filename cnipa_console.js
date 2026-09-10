@@ -824,12 +824,14 @@
     // ===== 推送入库（国知局数据 cnipa_data） =====
     // CNIPA 网页跨域把当前表内专利字段推到 OA 的 /open/patent_analysis/api/cnipa-data/save。
     // 跨域策略：后端按 text/plain 原始 body 解析（不发 application/json，避免 CORS 预检）。
-    // 生产默认（2026-09-09 用户定）：端口接收 = 直连 OA 服务器 Tomcat 7071 端口：
-    //   http://43.143.107.131:7071/open/patent_analysis/api/cnipa-data/save
-    // 注意：CNIPA 官网是 https 页面时，浏览器会把对 http:// 目标的 fetch 当混合内容拦掉（报 Failed to fetch）。
-    //   若被拦：把下面地址临时改回 https://xzcloud.cloud/open/patent_analysis/api/cnipa-data/save（服务器 https 反代）。
-    // 本机调试（OA 跑在 localhost:8080）时把下面地址临时改回 http://localhost:8080/open/patent_analysis/api/cnipa-data/save。
-    var OA_PUSH_URL = 'http://43.143.107.131:7071/open/patent_analysis/api/cnipa-data/save';
+    // 生产默认（2026-09-10 用户定）：走「域名」保存 = 服务器 https 反代 → OA Tomcat 7071 端口：
+    //   https://xzcloud.cloud/open/patent_analysis/api/cnipa-data/save
+    // 为什么用域名而不是直连 IP：CNIPA 官网是 https 页面，浏览器会把对 http:// 目标的 fetch
+    //   当混合内容拦掉（报 Failed to fetch）；域名走 https 就没有这个问题。
+    // 备用地址（域名不通时临时改回）：
+    //   直连 IP：http://43.143.107.131:7071/open/patent_analysis/api/cnipa-data/save（仅 http 页面可用）
+    //   本机调试（OA 跑在 localhost:8080）：http://localhost:8080/open/patent_analysis/api/cnipa-data/save
+    var OA_PUSH_URL = 'https://xzcloud.cloud/open/patent_analysis/api/cnipa-data/save';
     var OA_PUSH_AUTO_KEY = 'oa_cnipa_push_auto_20260903';
     // 行内中文表头 → 后端 cnipa_data 字段（后端兼容中文 key，这里直接转驼峰）
     var CNIPA_TO_DB = {
