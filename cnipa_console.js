@@ -1,6 +1,10 @@
-// ===== 复制以下全部代码，粘贴到 CNIPA 官网 F12 Console 回车运行000 233=====
+// ===== 复制以下全部代码，粘贴到 CNIPA 官网 F12 Console 回车运行 版本号1.1====
+// 版本号显示在面板标题栏「CNIPA 批量查询」右边，值取下面的 VERSION 常量；改版本时这一行和常量一起改。
 (function () {
     if (document.getElementById('oa-cnipa-panel')) { alert('面板已存在'); return; }
+
+    // 面板版本号：贴在标题栏上，方便一眼确认对方手上跑的是哪一版（反馈问题时先问这个）
+    var VERSION = '1.1';
 
     // ===== 接口配置 =====
     var APIS = {
@@ -199,16 +203,28 @@
     function isBlank(v){ return v === undefined || v === null || String(v).trim() === ''; }
     // 「缺什么补什么」：按行看，某个已勾选显示字段仍是空白 → 若它来源接口没「成功取过」就需要查该接口填上。
     // 字段已有数据绝不重查、绝不覆盖（公司搜索出的行已带 名称/类型/状态/申请人，不勾 代理所 就不会去查 sqxx）；
-    // 只有「成功取过」才不再重查——含可选接口 404 空记录（确证无质押/许可/通知书等，字段空是最终态）；
-    // 取过但失败(ok:false)且字段仍空白 → 仍算缺，补齐空白会再查（如 sqxx 404=该号无公开记录，整行空白应能重查并被报失败）。
+    // 只有「成功取过」才不再重查——「确证无」只认 HTTP 200 且数据为空（解析器落 未见质押信息/无保全 等明示文案）；
+    // 404/401/限流/非JSON 等一律记 ok:false，六个接口一视同仁（无例外白名单），字段仍空白就算缺、补齐空白会再查。
+    // 另：行上「查询错误」记着的失败接口即使对应列没勾也纳入重查，
+    // 否则「没勾该列但确实查失败」的接口会永远挂着错误、点补齐空白不再访问它。
     function rowNeededApis(row, headers) {
         var need = [], want = {};
+        function taken(k){ return !!(row._results && row._results[k] && row._results[k].ok); }  // 已成功取过
+        function add(k){ if(!want[k]){ want[k] = 1; need.push(k); } }
         (headers || []).forEach(function(h){
             var k = HEADER_API[h];
             if(!k || want[k]) return;
-            if(row._results && row._results[k] && row._results[k].ok) return;  // 该接口已成功取过 → 不再重查
+            if(taken(k)) return;                                                // 该接口已成功取过 → 不再重查
             if(!isBlank(row[h])) return;                                        // 该字段已有数据 → 不覆盖
-            want[k] = 1; need.push(k);
+            add(k);
+        });
+        // 上次查失败的接口（行上「查询错误」记着的）也要能补上：只看勾选列会漏掉「没勾该列、
+        // 但之前确实查失败」的接口，那种错误会一直挂在行上、点「补齐空白」永远不重查它。
+        // 该接口对应的字段若已全有值就不再查（不覆盖已有数据）。
+        (row._failedKeys || []).forEach(function(k){
+            if(want[k] || taken(k)) return;
+            var hasBlank = ALL_HEADERS.some(function(h){ return HEADER_API[h] === k && isBlank(row[h]); });
+            if(hasBlank) add(k);
         });
         return need;
     }
@@ -694,15 +710,18 @@
                     var done=function(t){
                         // 401 = 登录态过期：清除授权、记录错误、尝试下一个接口，不中断批量查询
                         if(resp.status===401){ auth.authorization=''; diagErr('401登录态过期', resp.status); errors.push('登录态过期'); tryNext(i+1); return; }
-                        // 404 = 该接口对这件无记录。只有「确证无→明示」的可选接口（质押/保全/许可备案，解析器会落
-                        // “未见质押信息/无保全/未见许可备案信息”标记）才按空数据成功处理，字段空=最终态、不再重查；
-                        // sqxx/gbggxx 404 = 该申请号在该子系统查不到 → 记为失败(ok:false)，整行仍可被补齐空白/失败重查
-                        // 反复重查并报出（2026-09-06：gbggxx 授权公告日 404 曾被误当「成功取过」，点补齐空白显示“齐全”不再重跑）
+                        // 404 = 该接口对这件查不到（接口层异常/该子系统无此记录），一律按失败处理：
+                        // 记 ok:false 进 _failedKeys → 「查询错误」里报出来，且整行可被「补齐空白」/「失败重查」
+                        // 反复重查（2026-09-10 用户口径：sqxx/gbggxx/fyxx/zlqzyxx/ssxkba/tzs 六个接口一视同仁，
+                        // 没有例外白名单——宁可每次重查，也不要静默当「确证无」导致数据永久缺失）。
+                        // 「确证无→明示」（未见质押信息/未见许可备案信息/无保全）改由「HTTP 200 但数据为空」表达：
+                        // 那条路仍走 resolve(ok:true)，解析器照常落明示文案。
+                        // 2026-09-06 教训：gbggxx 授权公告日 404 曾被误当「成功取过」，点补齐空白显示“齐全”不再重跑。
                         if(resp.status===404){
                             diagErr('接口404无记录', resp.status);
-                            if(apiKey==='sqxx'){ saw404 = true; errors.push('无申请信息记录(404)'); tryNext(i+1); return; }
-                            if(apiKey==='gbggxx'){ saw404 = true; errors.push('无公告记录(404)'); tryNext(i+1); return; }
-                            resolve({code:200, data:null}); return;
+                            saw404 = true;
+                            errors.push('无' + APIS[apiKey].label + '记录(404)');
+                            tryNext(i+1); return;
                         }
                         var throttled = isThrottleStatus(resp.status);
                         if(throttled){ triggerCool(); diagErr('HTTP'+resp.status+'限流', resp.status); }
@@ -2135,13 +2154,16 @@
         '#oa-cnipa-preview th{background:#f8fafc;position:sticky;top:0;}'+
         '#oa-cnipa-resize{position:absolute;right:0;bottom:0;width:16px;height:16px;cursor:nwse-resize;background:linear-gradient(135deg,transparent 50%,#999 50%);}'+
         '#oa-cnipa-head .head-btn{cursor:pointer;padding:0 6px;font-size:16px;line-height:1;margin-left:8px;}'+
+        '#oa-cnipa-head .head-ver{font-size:11px;font-weight:400;opacity:.75;margin-left:8px;vertical-align:middle;}'+
         '#oa-cnipa-spinner{display:none;width:14px;height:14px;border:2px solid #cbd5e1;border-top-color:#3664d1;border-radius:50%;animation:oa-cnipa-spin 0.7s linear infinite;vertical-align:middle;margin-right:6px;}'+
         '@keyframes oa-cnipa-spin{to{transform:rotate(360deg);}}';
     document.documentElement.appendChild(s);
 
     var panel=document.createElement('div');
     panel.id='oa-cnipa-panel';
-    panel.innerHTML='<div id="oa-cnipa-head"><b>CNIPA 批量查询</b><span><span id="oa-cnipa-max" class="head-btn" title="最大化/还原">□</span><span id="oa-cnipa-close" class="head-btn" title="关闭">×</span></span></div>'+
+    // 标题和版本号必须包在同一个 span 里：head 是 justify-content:space-between，
+    // 多出一个直接子元素就会被摆到正中间，版本号会飘到标题和按钮之间。
+    panel.innerHTML='<div id="oa-cnipa-head"><span><b>CNIPA 批量查询</b><span class="head-ver" title="面板版本号">v'+VERSION+'</span></span><span><span id="oa-cnipa-max" class="head-btn" title="最大化/还原">□</span><span id="oa-cnipa-close" class="head-btn" title="关闭">×</span></span></div>'+
         '<div id="oa-cnipa-body"><div id="oa-cnipa-status"></div>'+
         '<div id="oa-cnipa-search"><div style="font-weight:700;color:#334155;margin-bottom:6px;">按条件查询</div>'+
         '<div style="display:flex;flex-wrap:wrap;align-items:center;">'+
@@ -2155,7 +2177,7 @@
         '</div>'+
         '<textarea id="oa-cnipa-input" placeholder="每行一个申请号/专利号；或用上方条件搜索"></textarea>'+
         '<div><button id="oa-cnipa-start" class="primary">开始查询</button><button id="oa-cnipa-update">补齐空白</button><button id="oa-cnipa-pause" disabled>暂停</button><button id="oa-cnipa-export">导出CSV</button><button id="oa-cnipa-push">推送入库</button><button id="oa-cnipa-fail-retry">失败重查</button><button id="oa-cnipa-clear">清空</button></div>'+
-        '<div style="font-size:12px;color:#334155;margin:2px 0 6px;"><label style="cursor:pointer;"><input type="checkbox" id="oa-cnipa-push-auto"> 查询/更新完成后自动推送入库（国知局数据）</label><span style="color:#94a3b8;margin-left:8px;">推送：</span><span style="color:#94a3b8;font-family:Consolas,monospace;" id="oa-cnipa-push-url"></span></div>'+
+        '<div style="font-size:12px;color:#334155;margin:2px 0 6px;"><label style="cursor:pointer;"><input type="checkbox" id="oa-cnipa-push-auto"> 查询/更新完成后自动推送入库（国知局数据）</label></div>'+
         '<div id="oa-cnipa-fields" style="margin:8px 0;padding:8px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">'+
         '<div id="oa-cnipa-fields-head" style="cursor:pointer;user-select:none;font-weight:700;color:#334155;"><span id="oa-cnipa-fields-toggle">-</span> 显示字段 <span style="color:#64748b;font-weight:400;font-size:12px;">（勾选要显示的列）</span></div>'+
         '<div id="oa-cnipa-field-list" style="margin-top:6px;"></div>'+
@@ -2254,8 +2276,6 @@
         if(!el) return;
         el.checked = isPushAutoOn();
         el.onchange = function(){ setPushAutoOn(el.checked); };
-        var urlEl = document.getElementById('oa-cnipa-push-url');
-        if(urlEl) urlEl.textContent = OA_PUSH_URL.replace(/^https?:\/\//, '').split('/')[0];
     })();
     document.getElementById('oa-cnipa-fail-retry').onclick=manualRetry;
     document.getElementById('oa-cnipa-clear').onclick=function(){
