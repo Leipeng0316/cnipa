@@ -861,6 +861,11 @@
         '最近缴费种类':'lastPayType','变更费':'changeFee','质押信息':'pledgeInfo','许可备案信息':'licenseInfo',
         '查询错误':'queryError'
     };
+    // 自动推送开关（2026-09-11 起界面上不再显示开关，见下）：
+    // 默认**开** —— localStorage 里没写过就是开，只有显式写过 '0' 才是关。
+    // 界面上那个勾选框已经按用户要求删掉了，但功能照旧跑；想在某台机器上关掉，在 CNIPA 页面控制台执行：
+    //   localStorage.setItem('oa_cnipa_push_auto_20260903','0')
+    // 想开回来就把 '0' 改成 '1'（或删掉这个键，回到默认开）。
     function isPushAutoOn(){
         try { return localStorage.getItem(OA_PUSH_AUTO_KEY) !== '0'; } catch(e){ return true; }
     }
@@ -2177,7 +2182,6 @@
         '</div>'+
         '<textarea id="oa-cnipa-input" placeholder="每行一个申请号/专利号；或用上方条件搜索"></textarea>'+
         '<div><button id="oa-cnipa-start" class="primary">开始查询</button><button id="oa-cnipa-update">补齐空白</button><button id="oa-cnipa-pause" disabled>暂停</button><button id="oa-cnipa-export">导出CSV</button><button id="oa-cnipa-push">推送入库</button><button id="oa-cnipa-fail-retry">失败重查</button><button id="oa-cnipa-clear">清空</button></div>'+
-        '<div style="font-size:12px;color:#334155;margin:2px 0 6px;"><label style="cursor:pointer;"><input type="checkbox" id="oa-cnipa-push-auto"> 查询/更新完成后自动推送入库（国知局数据）</label></div>'+
         '<div id="oa-cnipa-fields" style="margin:8px 0;padding:8px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;">'+
         '<div id="oa-cnipa-fields-head" style="cursor:pointer;user-select:none;font-weight:700;color:#334155;"><span id="oa-cnipa-fields-toggle">-</span> 显示字段 <span style="color:#64748b;font-weight:400;font-size:12px;">（勾选要显示的列）</span></div>'+
         '<div id="oa-cnipa-field-list" style="margin-top:6px;"></div>'+
@@ -2271,12 +2275,6 @@
     };
     document.getElementById('oa-cnipa-export').onclick=exportXlsx;
     document.getElementById('oa-cnipa-push').onclick=manualPushRows;
-    (function(){
-        var el = document.getElementById('oa-cnipa-push-auto');
-        if(!el) return;
-        el.checked = isPushAutoOn();
-        el.onchange = function(){ setPushAutoOn(el.checked); };
-    })();
     document.getElementById('oa-cnipa-fail-retry').onclick=manualRetry;
     document.getElementById('oa-cnipa-clear').onclick=function(){
         if(batchActive) cancelActiveBatch();   // 运行中先取消本批（不自动推送），再清表
