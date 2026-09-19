@@ -1,10 +1,10 @@
-// ===== 复制以下全部代码，粘贴到 CNIPA 官网 F12 Console 回车运行 版本号1.1====
+// ===== 复制以下全部代码，粘贴到 CNIPA 官网 F12 Console 回车运行 版本号1.2====
 // 版本号显示在面板标题栏「CNIPA 批量查询」右边，值取下面的 VERSION 常量；改版本时这一行和常量一起改。
 (function () {
     if (document.getElementById('oa-cnipa-panel')) { alert('面板已存在'); return; }
 
     // 面板版本号：贴在标题栏上，方便一眼确认对方手上跑的是哪一版（反馈问题时先问这个）
-    var VERSION = '1.1';
+    var VERSION = '1.2';
 
     // ===== 接口配置 =====
     var APIS = {
@@ -13,7 +13,8 @@
         fyxx:   { path: '/api/view/gn/fyxx',              label: '费用信息' },
         zlqzyxx:{ path: '/api/view/gn/get-zlqzydjh-list', label: '质押信息' },
         ssxkba: { path: '/api/view/gn/get-ssxkbah-list',  label: '许可备案' },
-        tzs:    { path: '/api/view/gn/scxx/tzs',           label: '通知书信息' }
+        tzs:    { path: '/api/view/gn/scxx/tzs',           label: '通知书信息' },
+        fwxx:   { path: '/api/view/gn/fwxx',               label: '发文信息' }
     };
     var API_KEYS = Object.keys(APIS);
     // 查询速度调节（SuperEngine 方案，2026-09-02 + 2026-09-05 重排）：
@@ -153,7 +154,7 @@
         if(a) a.disabled = batchActive && !batchPaused;
     }
     // 全部字段（顺序：申请日放在专利类型后面；含「是否保全」=通知书名称含「保全」则代表有保全信息）
-    var ALL_HEADERS = ['专利号','专利名称','专利类型','申请日','案件状态','申请人','费用种类','应缴金额','截止日期','代理所','质押状态','授权公告日','法律状态','是否保全','费用状态','最近缴费人','最近缴费种类','变更费','质押信息','许可备案信息'];
+    var ALL_HEADERS = ['专利号','专利名称','专利类型','申请日','案件状态','申请人','费用种类','应缴金额','截止日期','代理所','质押状态','授权公告日','证书发文日','下证周期','法律状态','是否保全','费用状态','最近缴费人','最近缴费种类','变更费','质押信息','许可备案信息'];
     // 默认显示字段（2026-09-03 起恢复 8 个基础列，代理所默认勾选——勾上「代理所」才会让 sqxx 补代理所/确证无则落「无代理所」；
     // 按「字段→接口依赖」裁剪接口计划：默认只跑 sqxx+fyxx 两接口/件（代理所/名称/类型/状态/申请人同源 sqxx）；
     // 勾「质押状态/质押信息/是否保全/许可备案信息/授权公告日」对应 zlqzyxx/tzs/ssxkba/gbggxx —— 选了哪个才多跑哪个接口）
@@ -191,6 +192,10 @@
         '专利名称':'sqxx','专利类型':'sqxx','申请日':'sqxx','案件状态':'sqxx','申请人':'sqxx','代理所':'sqxx','法律状态':'sqxx',
         '费用种类':'fyxx','应缴金额':'fyxx','截止日期':'fyxx','费用状态':'fyxx','最近缴费人':'fyxx','最近缴费种类':'fyxx','变更费':'fyxx',
         '授权公告日':'gbggxx',
+        // 两个发文日同源 fwxx：都映射到这里，只勾「下证周期」才会去请求 fwxx。
+        // 不会因此重复请求——rowNeededApis 的 taken() 是按「接口」判定的（_results.fwxx.ok），
+        // fwxx 一旦成功取过，两列整体跳过，第 2/3 遍补查不再打它。
+        '证书发文日':'fwxx','下证周期':'fwxx',
         '质押状态':'zlqzyxx','质押信息':'zlqzyxx',
         '是否保全':'tzs',
         '许可备案信息':'ssxkba'
@@ -348,6 +353,18 @@
     }
     function parseDate(text) {
         var raw=clean(text); if(!raw) return null;
+        // 8 位无分隔（CNIPA 的 fawenr 就是这种：20251024）。必须整串匹配，免得在长文本里误抓一串数字。
+        var m8=raw.match(/^(\d{4})(\d{2})(\d{2})$/);
+        if(m8){
+            var y8=Number(m8[1]),mo8=Number(m8[2]),dy8=Number(m8[3]);
+            // 越界必须自己拦：JS 的 new Date(9999,98,99) 会自动进位而不是 NaN，
+            // 不校验的话任何 8 位数字都会被当合法日期
+            if(mo8<1||mo8>12||dy8<1||dy8>31) return null;
+            var d8=new Date(y8,mo8-1,dy8);
+            // 回读比对，挡住 2 月 30 日这类「不存在但被静默归一」的日期
+            if(isNaN(d8.getTime())||d8.getFullYear()!==y8||d8.getMonth()!==mo8-1||d8.getDate()!==dy8) return null;
+            return d8;
+        }
         var m=raw.match(/(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})/);
         if(!m) return null;
         var d=new Date(Number(m[1]),Number(m[2])-1,Number(m[3]));
@@ -588,6 +605,45 @@
         return { status: '有保全', info: found.slice(0, 3).join('；') };
     }
 
+    // ===== 解析发文信息（fwxx）：证书发文日 + 办理登记手续通知书发文日 =====
+    //   证书发文日       ← data.zhuanlizsfw.zhuanlizsfwList[].fawenr
+    //   办登通知书发文日 ← data.tongzhishufw.tongzhishufwList[] 里 tongzhismc=办理登记手续通知书 那条的 fawenr
+    // 注意：专利证书发文是**独立分组**，那组条目只有 fawenr+收件人、**没有 tongzhismc**，
+    // 只能靠「它在哪个分组」区分，不能按名称匹配。
+    // 各组都可能多条 → 取 fawenr 最大（最新）的一条。fawenr 是定长 YYYYMMDD，字符串比较等价于日期比较。
+    function parseFwxx(fwxx) {
+        var root = getRoot(fwxx);
+        function latestFawenr(rows, nameFilter) {
+            var best = '';
+            (rows || []).forEach(function (r) {
+                if (!r || typeof r !== 'object') return;
+                if (nameFilter && !nameFilter(firstTextByKeys(r, ['tongzhismc','fwmc','mc']))) return;
+                var f = clean(firstTextByKeys(r, ['fawenr','fawenrq','fawenriq']));
+                if (/^\d{8}$/.test(f) && f > best) best = f;
+            });
+            return best ? formatDate(best) : '';
+        }
+        var certDate = latestFawenr(asList(getSection(root, 'zhuanlizsfw'), ['zhuanlizsfwList']), null);
+        var regDate = latestFawenr(asList(getSection(root, 'tongzhishufw'), ['tongzhishufwList']),
+            function (n) { return clean(n).indexOf('办理登记手续通知书') > -1; });
+        return { certDate: certDate, regDate: regDate, cycle: dayDiffText(certDate, regDate) };
+    }
+    // 下证周期 = 证书发文日 − 办理登记手续通知书发文日（自然日，带单位「N 天」）。
+    // 任一日期缺失、或算出负数（数据异常）→ 空串，宁可留空也不落误导性的数字。
+    function dayDiffText(certDate, regDate) {
+        var a = parseDate(certDate), b = parseDate(regDate);
+        if (!a || !b) return '';
+        var days = Math.round((a - b) / 86400000);
+        return days >= 0 ? days + ' 天' : '';
+    }
+    // 下证周期「超半年」阈值：183 天（365/2，用户 2026-09-17 拍板）。
+    // 单元格里放的是展示串「N 天」，这里取其中的整数比；空值、和用户手改成的非「N 天」文本一律不算超标。
+    var SLOW_GRANT_DAYS = 183;
+    function isSlowGrant(text) {
+        var m = String(text == null ? '' : text).match(/^(\d+)\s*天$/);
+        return !!m && Number(m[1]) > SLOW_GRANT_DAYS;
+    }
+
     // ===== 错误统计（诊断用，不影响查询逻辑）=====
     // 每跑完一批（开始查询/补齐空白/失败重查）在进度条末尾追加一行错误统计 + 控制台 console.table；
     // 也可随时在控制台执行 window.oaCnipaErrReport() 看当前累计。
@@ -759,6 +815,7 @@
         var pledge = results.zlqzyxx && results.zlqzyxx.ok ? parsePledge(results.zlqzyxx.data, results.sqxx && results.sqxx.ok ? results.sqxx.data : null) : {};
         var license = results.ssxkba && results.ssxkba.ok ? parseLicense(results.ssxkba.data) : {};
         var pres = results.tzs && results.tzs.ok ? parsePreservation(results.tzs.data) : {};
+        var fw = results.fwxx && results.fwxx.ok ? parseFwxx(results.fwxx.data) : {};
         var row = {};
         row['专利号']=cleaned;
         row['专利名称']=sq.patentName||'';
@@ -770,6 +827,9 @@
         // 确证无代理机构 → 落「无代理所」（同 质押状态=未见质押信息/是否保全=无保全 的“确证无→明示”口径），不再留空白
         row['代理所']=sq.agency || (results.sqxx && results.sqxx.ok ? '无代理所' : '');
         row['授权公告日']=grantDate||'';
+        // 发文两列：日期照实显示；下证周期在缺任一日时由 dayDiffText 返回空串 → 留空
+        row['证书发文日']=fw.certDate||'';
+        row['下证周期']=fw.cycle||'';
         row['法律状态']=sq.legalStatus||'';
         row['是否保全']=pres.status||'';
         row['费用种类']=fee.annualType||'';
@@ -1513,8 +1573,10 @@
             cellHtml += '<td class="oa-cnipa-op">'+(r['专利号'] ? '<a class="oa-cnipa-detail" href="javascript:void(0)" data-appno="'+esc(r['专利号'])+'" title="在新窗口打开 CNIPA 专利详情页">详情</a>' : '')+'</td>';
             cellHtml += selectedHeaders.map(function(h){
                 var raw = r[h] || '';
+                // 下证周期超半年（183 天）标红 —— 周期越长说明下证越慢，要盯
+                var warnCls = (h === '下证周期' && isSlowGrant(raw)) ? ' oa-cnipa-warn' : '';
                 // 可编辑单元格：data-i=rows 下标、data-h=列名；双击进入编辑（改专利号会重置该行 _results/_failedKeys）
-                return '<td class="oa-cnipa-ed" data-i="'+item.idx+'" data-h="'+esc(h)+'" title="'+esc(raw)+'">'+esc(raw)+'</td>';
+                return '<td class="oa-cnipa-ed'+warnCls+'" data-i="'+item.idx+'" data-h="'+esc(h)+'" title="'+esc(raw)+'">'+esc(raw)+'</td>';
             }).join('');
             return '<tr>'+cellHtml+'</tr>';
         }).join('');
@@ -2154,6 +2216,7 @@
         '#oa-cnipa-preview td.oa-cnipa-no{color:#94a3b8;font-size:11px;}'+
         '#oa-cnipa-preview td.selected{background:#bfdbfe;outline:2px solid #3664d1;outline-offset:-2px;}'+
         '#oa-cnipa-preview td.oa-cnipa-ed:hover{background:#f8fafc;}'+
+        '#oa-cnipa-preview td.oa-cnipa-warn{color:#dc2626;font-weight:700;}'+
         '#oa-cnipa-preview td[contenteditable="true"]{cursor:text;-webkit-user-select:text;user-select:text;outline:2px solid #3664d1;outline-offset:-2px;background:#fff;white-space:pre-wrap;}'+
         '#oa-cnipa-panel button:disabled{opacity:.5;cursor:not-allowed;}'+
         '#oa-cnipa-preview th{background:#f8fafc;position:sticky;top:0;}'+
